@@ -1,0 +1,17 @@
+data:
+  use_popt_speech: true
+  brain_root_speech: "C:/.../PopulationTransformer/saved_examples/all_test_word_onset"
+  speech_manifest:   "C:/.../PopulationTransformer/saved_examples/all_test_word_onset/speech_labels.csv"
+
+  split_mode: "by_trial"
+  train_subject_trials:
+    - subject: "sub_1"
+      trials: ["trial000"]
+  val_subject_trials:
+    - subject: "sub_1"
+      trials: ["trial002"]
+      
+training:
+  brain_only: true
+  lambda_cls: 1.0
+  lambda_smooth: 0.0

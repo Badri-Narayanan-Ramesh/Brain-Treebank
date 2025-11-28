@@ -207,3 +207,8 @@ marimo/_lsp/
 __marimo__/
 
 References/*
+saved_examples/*
+*.pyc
+braintreebank_data/*
+pretrained_weights/*
+cached_data_arrays/*
