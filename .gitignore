@@ -212,3 +212,5 @@ saved_examples/*
 braintreebank_data/*
 pretrained_weights/*
 cached_data_arrays/*
+checkpoints_popt_speech/*
+Report/*
