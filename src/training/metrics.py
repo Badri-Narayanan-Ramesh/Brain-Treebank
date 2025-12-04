@@ -46,17 +46,58 @@ def compute_auc(scores: torch.Tensor, labels: torch.Tensor) -> float:
 
 def compute_embedding_jitter(
     z_brain: torch.Tensor,
-    meta: Optional[dict] = None,
+    meta: Optional[list] = None,
 ) -> float:
     """
-    Simple jitter metric: L2 difference between consecutive embeddings.
+    Compute a simple jitter metric from a sequence of embeddings.
 
-    z_brain: (N, d_model)
+    If `meta` is provided and is a list of dictionaries containing
+    `subject`, `trial`, and `idx` entries for each sample, the
+    embeddings will be sorted by (subject, trial, idx) before
+    differences are computed.  Otherwise, the embeddings are used in
+    the original order.
+
+    Parameters
+    ----------
+    z_brain : torch.Tensor
+        Brain embeddings of shape (N, d).
+    meta : list of dict, optional
+        Metadata for each sample; when provided, should have the same
+        length as z_brain and contain keys `subject`, `trial`, and
+        `idx` (integer index within the trial).  Sorting by these
+        fields approximates temporal ordering within each trial.
+
+    Returns
+    -------
+    float
+        The mean L2 distance between consecutive embeddings in the
+        sorted sequence.  If less than two embeddings are present,
+        returns 0.0.
     """
     if z_brain.size(0) < 2:
         return 0.0
 
-    diffs = z_brain[1:] - z_brain[:-1]  # (N-1, d)
+    # If meta is provided, sort the embeddings accordingly
+    if meta is not None and isinstance(meta, list) and len(meta) == z_brain.size(0):
+        # Build list of tuples (subject, trial, idx, embedding)
+        entries = []
+        for i, m in enumerate(meta):
+            subj = m.get("subject")
+            trial = m.get("trial")
+            idx = int(m.get("idx", 0))
+            entries.append((subj, trial, idx, z_brain[i]))
+        # Sort by subject, trial, idx
+        entries.sort(key=lambda x: (x[0], x[1], x[2]))
+        # Extract sorted embeddings
+        sorted_z = [e[3] for e in entries]
+        z_seq = torch.stack(sorted_z, dim=0)
+    else:
+        z_seq = z_brain
+
+    if z_seq.size(0) < 2:
+        return 0.0
+
+    diffs = z_seq[1:] - z_seq[:-1]
     jitter = torch.sqrt((diffs ** 2).sum(dim=-1)).mean()
     return float(jitter.item())
 

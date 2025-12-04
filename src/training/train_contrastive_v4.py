@@ -1,4 +1,4 @@
-# src/training/train_contrastive_v3.py
+# src/training/train_contrastive_v4.py
 
 import os
 import argparse
@@ -20,7 +20,7 @@ from src.models.brain_transformer import PopulationTransformer
 from src.models.audio_encoder import ConvAudioEncoder
 from src.models.projection_heads import ProjectionHead
 from src.models.popt_speech_model import PopTSpeechModel
-from src.training.losses import InfoNCELoss, temporal_smoothing_loss
+from src.training.losses import InfoNCELoss
 from src.training.metrics import (
     compute_retrieval_at_k_sampled,
     compute_auc,
@@ -44,6 +44,105 @@ def iter_trainable_params(*modules: nn.Module):
         for p in m.parameters():
             if p.requires_grad:
                 yield p
+
+
+# -------------------------------------------------------------------------
+# Smoothing helper
+# -------------------------------------------------------------------------
+def compute_smooth_loss(
+    reps: torch.Tensor,
+    meta,
+    lambda_smooth: float,
+) -> torch.Tensor:
+    """
+    Compute a temporal smoothness loss over a batch of representations.
+
+    Parameters
+    ----------
+    reps : torch.Tensor
+        Batch of representations of shape (B, d). Each row corresponds to
+        one sample in the batch.
+    meta : dict OR list of dict
+        - If dict (DataLoader default): keys 'subject', 'trial', 'idx'
+          mapped to lists / tensors.
+        - If list of dict: each element has keys 'subject', 'trial', 'idx'.
+    lambda_smooth : float
+        Smoothness coefficient. If <= 0.0, returns a zero tensor.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar loss tensor on the same device as `reps`.
+
+    Notes
+    -----
+    - Samples are grouped by (subject, trial) and sorted by `idx` so that
+      differences are computed along the time dimension.
+    - If a batch contains only one sample from a given trial, it does not
+      contribute to the smoothness loss.
+    """
+    if lambda_smooth <= 0.0:
+        return torch.tensor(0.0, device=reps.device, dtype=reps.dtype)
+
+    B = reps.size(0)
+    entries = []
+
+    # Case 1: meta is a dict-of-lists/tensors (what DataLoader gives us)
+    if isinstance(meta, dict):
+        subjects = meta.get("subject", [])
+        trials = meta.get("trial", [])
+        idxs = meta.get("idx", None)
+
+        for i in range(B):
+            subj = subjects[i] if isinstance(subjects, (list, tuple)) else subjects[i]
+            trial = trials[i] if isinstance(trials, (list, tuple)) else trials[i]
+
+            if isinstance(idxs, torch.Tensor):
+                idx_val = int(idxs[i].item())
+            elif isinstance(idxs, (list, tuple, np.ndarray)):
+                idx_val = int(idxs[i])
+            elif idxs is None:
+                idx_val = i
+            else:
+                idx_val = int(idxs)
+
+            entries.append((str(subj), str(trial), idx_val, reps[i]))
+
+    # Case 2: meta is a list/tuple of small dicts (fallback)
+    elif isinstance(meta, (list, tuple)):
+        for i, m in enumerate(meta):
+            subj = m.get("subject")
+            trial = m.get("trial")
+            idx_val = int(m.get("idx", 0))
+            entries.append((str(subj), str(trial), idx_val, reps[i]))
+    else:
+        raise TypeError(f"Unexpected meta type in compute_smooth_loss: {type(meta)}")
+
+    # If we have fewer than 2 samples, no smoothness term
+    if len(entries) < 2:
+        return torch.tensor(0.0, device=reps.device, dtype=reps.dtype)
+
+    # Sort by subject, trial, and idx to establish temporal order
+    entries.sort(key=lambda x: (x[0], x[1], x[2]))
+
+    # Accumulate squared differences between successive entries within
+    # the same (subject, trial)
+    loss_sum = 0.0
+    count = 0
+
+    for i in range(1, len(entries)):
+        prev_subj, prev_trial, prev_idx, prev_rep = entries[i - 1]
+        curr_subj, curr_trial, curr_idx, curr_rep = entries[i]
+        if prev_subj == curr_subj and prev_trial == curr_trial:
+            diff = curr_rep - prev_rep
+            loss_sum += (diff * diff).sum()
+            count += 1
+
+    if count == 0:
+        return torch.tensor(0.0, device=reps.device, dtype=reps.dtype)
+
+    loss = (loss_sum / count) * lambda_smooth
+    return loss.to(reps.device)
 
 
 # -------------------------------------------------------------------------
@@ -82,6 +181,7 @@ def evaluate_generic(
     all_brain_z = []
     all_u = []
     all_v = []
+    all_meta: list = []
 
     with torch.no_grad():
         for batch in loader:
@@ -103,6 +203,9 @@ def evaluate_generic(
             all_scores.append(scores)
             all_labels.append(labels)
             all_brain_z.append(z_brain)
+            # Accumulate meta for sorting embeddings when computing jitter
+            if isinstance(meta, list):
+                all_meta.extend(meta)
 
             if (not brain_only) and audio is not None:
                 audio = audio.to(device)
@@ -120,7 +223,7 @@ def evaluate_generic(
     all_brain_z = torch.cat(all_brain_z, dim=0)
 
     auc = compute_auc(all_scores, all_labels)
-    jitter = compute_embedding_jitter(all_brain_z, meta=None)
+    jitter = compute_embedding_jitter(all_brain_z, meta=all_meta)
 
     if (not brain_only) and all_u and all_v:
         all_u = torch.cat(all_u, dim=0)
@@ -150,6 +253,7 @@ def evaluate_popt(
     all_scores = []
     all_labels = []
     all_cls = []
+    all_meta: list = []
 
     with torch.no_grad():
         for batch in loader:
@@ -168,6 +272,11 @@ def evaluate_popt(
             all_scores.append(scores)
             all_labels.append(labels)
             all_cls.append(cls)
+            # Extend metadata list for jitter computation.  We keep the
+            # meta dictionaries unchanged; these will be used to sort
+            # embeddings in compute_embedding_jitter.
+            if isinstance(meta, list):
+                all_meta.extend(meta)
 
     if not all_scores:
         return 0.0, 0.0, 0.5, 0.0
@@ -177,7 +286,10 @@ def evaluate_popt(
     all_cls = torch.cat(all_cls, dim=0)
 
     auc = compute_auc(all_scores, all_labels)
-    jitter = compute_embedding_jitter(all_cls, meta=None)
+    # Pass the aggregated meta list to compute_embedding_jitter so
+    # embeddings are sorted by (subject, trial, idx).  If meta is empty
+    # the function will fallback to raw ordering.
+    jitter = compute_embedding_jitter(all_cls, meta=all_meta)
 
     # No contrastive or audio retrieval in this mode
     ret2, chance = 0.0, 0.0
@@ -276,7 +388,12 @@ def train(config_path: str):
                 cls = popt_model.cls_embedding(brain) # (B, hidden_dim)
 
                 loss_cls = bce(logits, labels)
-                loss_sm = temporal_smoothing_loss(cls, meta, lambda_smooth)
+                # Compute the temporal smoothness loss on the PopT CLS embeddings.
+                # This uses the compute_smooth_loss helper which sorts samples by
+                # (subject, trial, idx) and averages squared differences.  It
+                # returns zero if lambda_smooth <= 0 or there are insufficient
+                # samples per trial.
+                loss_sm = compute_smooth_loss(cls, meta, lambda_smooth)
                 loss = loss_cls + loss_sm
 
                 loss.backward()
@@ -534,7 +651,9 @@ def train(config_path: str):
             if brain_only:
                 logits = speech_head(z_brain).squeeze(-1)
                 loss_cls = bce(logits, labels)
-                loss_sm = temporal_smoothing_loss(z_brain, meta, lambda_smooth)
+                # Compute smoothness loss on z_brain representations.  The
+                # helper will handle lambda=0 and insufficient batch sizes.
+                loss_sm = compute_smooth_loss(z_brain, meta, lambda_smooth)
                 loss_con = torch.tensor(0.0, device=device)
                 loss = loss_cls + loss_sm
             else:
@@ -550,7 +669,9 @@ def train(config_path: str):
                 loss_con = contrastive_loss(u, v)
                 logits = speech_head(z_brain).squeeze(-1)
                 loss_cls = bce(logits, labels)
-                loss_sm = temporal_smoothing_loss(z_brain, meta, lambda_smooth)
+                # Compute smoothness loss on z_brain representations.  The
+                # helper will handle lambda=0 and insufficient batch sizes.
+                loss_sm = compute_smooth_loss(z_brain, meta, lambda_smooth)
                 loss = loss_con + lambda_cls * loss_cls + loss_sm
 
             loss.backward()

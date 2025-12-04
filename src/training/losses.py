@@ -42,6 +42,7 @@ def temporal_smoothing_loss(
     lambda_smooth: float = 0.0,
 ) -> torch.Tensor:
     """
+    FOR PHASE II : THIS IS NOT USED. compute_smooth_loss IN TRAIN_CONTRASTIVE_V4 IS USED.
     Simple temporal smoothing loss on brain embeddings.
 
     z_brain: (B, d_model)
